@@ -33,12 +33,6 @@ public class MovieController {
         return movie != null ? ResponseEntity.ok(movie) : ResponseEntity.notFound().build();
     }
 
-    @GetMapping("/winners")
-    public ResponseEntity<List<MovieEntity>> getWinners() {
-        List<MovieEntity> winners = movieService.getWinners();
-        return ResponseEntity.ok(winners);
-    }
-
     @GetMapping("/years")
     public ResponseEntity<List<Integer>> getYears() {
         List<Integer> years = movieService.getYears();
