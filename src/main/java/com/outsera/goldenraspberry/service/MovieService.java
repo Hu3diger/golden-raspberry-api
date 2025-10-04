@@ -13,15 +13,19 @@ import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.*;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 @Service
 public class MovieService {
+
+    private static final Pattern PRODUCER_SPLIT_PATTERN = Pattern.compile(",|\\sand\\s");
+    private static final int MIN_RECORD_LENGTH = 4;
 
     private final MovieRepository movieRepository;
 
@@ -31,56 +35,60 @@ public class MovieService {
     }
 
     @PostConstruct
+    @Transactional
     public void loadMoviesFromCsv() {
-        try {
-            ClassPathResource resource = new ClassPathResource("movielist.csv");
-            InputStreamReader inputStreamReader = new InputStreamReader(resource.getInputStream());
+        try (InputStreamReader reader = new InputStreamReader(
+                new ClassPathResource("movielist.csv").getInputStream());
+             CSVReader csvReader = createCsvReader(reader)) {
 
-            CSVParser parser = new CSVParserBuilder()
-                    .withSeparator(';')
-                    .build();
+            List<MovieEntity> movies = csvReader.readAll().stream()
+                    .filter(this::isValidRecord)
+                    .map(this::parseMovieRecord)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
 
-            CSVReader reader = new CSVReaderBuilder(inputStreamReader)
-                    .withCSVParser(parser)
-                    .build();
-
-            List<String[]> records = reader.readAll();
-            reader.close();
-
-            for (int i = 1; i < records.size(); i++) {
-                String[] record = records.get(i);
-                if (record.length >= 4) {
-                    try {
-                        if (record[0] == null || record[0].trim().isEmpty()) {
-                            continue;
-                        }
-
-                        int year = Integer.parseInt(record[0].trim());
-                        MovieEntity movie = new MovieEntity();
-                        movie.setYear(year);
-                        movie.setTitle(safeGet(record, 1));
-                        movie.setStudios(safeGet(record, 2));
-                        movie.setProducers(safeGet(record, 3));
-                        movie.setWinner(safeGet(record, 4));
-
-                        movieRepository.save(movie);
-                    } catch (NumberFormatException e) {
-                        System.out.println("Skipping line with invalid year: " + String.join(";", record));
-                        continue;
-                    }
-                }
-            }
+            movieRepository.saveAll(movies);
 
         } catch (IOException | CsvException e) {
             throw new RuntimeException("Error loading CSV file", e);
         }
     }
 
-    private String safeGet(String[] record, int index) {
-        if (record.length > index && record[index] != null) {
-            return record[index].trim();
+    private CSVReader createCsvReader(InputStreamReader reader) {
+        CSVParser parser = new CSVParserBuilder()
+                .withSeparator(';')
+                .build();
+
+        return new CSVReaderBuilder(reader)
+                .withCSVParser(parser)
+                .build();
+    }
+
+    private boolean isValidRecord(String[] record) {
+        return record.length >= MIN_RECORD_LENGTH
+                && record[0] != null
+                && !record[0].trim().isEmpty();
+    }
+
+    private MovieEntity parseMovieRecord(String[] record) {
+        try {
+            MovieEntity movie = new MovieEntity();
+            movie.setYear(Integer.parseInt(record[0].trim()));
+            movie.setTitle(safeGet(record, 1));
+            movie.setStudios(safeGet(record, 2));
+            movie.setProducers(safeGet(record, 3));
+            movie.setWinner(safeGet(record, 4));
+            return movie;
+        } catch (NumberFormatException e) {
+            System.err.println("Skipping line with invalid year: " + String.join(";", record));
+            return null;
         }
-        return "";
+    }
+
+    private String safeGet(String[] record, int index) {
+        return (record.length > index && record[index] != null)
+                ? record[index].trim()
+                : "";
     }
 
     public List<MovieEntity> getMovies(Integer year, Boolean winner) {
@@ -90,17 +98,12 @@ public class MovieService {
             return movieRepository.findByYear(year);
         } else if (winner != null) {
             return winner ? movieRepository.findWinners() : movieRepository.findNonWinners();
-        } else {
-            return movieRepository.findAll();
         }
+        return movieRepository.findAll();
     }
 
     public MovieEntity getMovieById(Long id) {
         return movieRepository.findById(id).orElse(null);
-    }
-
-    public List<MovieEntity> getWinners() {
-        return movieRepository.findWinners();
     }
 
     public List<Integer> getYears() {
@@ -110,79 +113,68 @@ public class MovieService {
     public IntervalResponseDto getProducerIntervals() {
         List<MovieEntity> winners = movieRepository.findWinners();
 
-        // 1. Group by Producer by collecting all winning years.
-        Map<String, List<Integer>> producerWins = getProducersYears(winners);
-
-        // 2. Generate all possible intervals for each producer.
-        List<ProducerIntervalDto> intervals = calculateAllIntervals(producerWins);
-
-        if (intervals.isEmpty()) {
+        if (winners.isEmpty()) {
             return new IntervalResponseDto(List.of(), List.of());
         }
 
-        // 3. Find min and max intervals.
-        return filterMinMaxIntervals(intervals);
+        IntervalTrackerService tracker = new IntervalTrackerService();
+        Map<String, List<Integer>> producerYears = new HashMap<>();
+
+        for (MovieEntity movie : winners) {
+            processMovieProducers(movie, producerYears, tracker);
+        }
+
+        return buildIntervalResponse(tracker);
     }
 
-    private Map<String, List<Integer>> getProducersYears(List<MovieEntity> winners) {
-        return winners.stream()
-                .flatMap(movie -> {
-                    String[] producerArray = movie.getProducers().split(",|\\sand\\s");
+    private void processMovieProducers(
+            MovieEntity movie,
+            Map<String, List<Integer>> producerYears,
+            IntervalTrackerService tracker) {
 
-                    return java.util.Arrays.stream(producerArray)
-                            .map(String::trim)
-                            .filter(producer -> !producer.isEmpty())
-                            .map(producer -> Map.entry(producer, movie.getYear()));
-                })
-                .collect(Collectors.groupingBy(
-                        Map.Entry::getKey,
-                        Collectors.mapping(Map.Entry::getValue, Collectors.toList())
-                ));
+        String[] producers = PRODUCER_SPLIT_PATTERN.split(movie.getProducers());
+
+        for (String producer : producers) {
+            producer = producer.trim();
+            if (producer.isEmpty()) continue;
+
+            processProducer(producer, movie.getYear(), producerYears, tracker);
+        }
     }
 
-    private List<ProducerIntervalDto> calculateAllIntervals(Map<String, List<Integer>> producerWins) {
-        return producerWins.entrySet().stream()
-                .filter(entry -> entry.getValue().size() > 1)
-                .flatMap(entry -> {
-                    String producer = entry.getKey();
-                    List<Integer> years = entry.getValue();
+    private void processProducer(
+            String producer,
+            int year,
+            Map<String, List<Integer>> producerYears,
+            IntervalTrackerService tracker) {
 
-                    years.sort(Comparator.naturalOrder());
+        List<Integer> years = producerYears.computeIfAbsent(producer, k -> new ArrayList<>());
+        int insertPos = insertYearSorted(years, year);
 
-                    return IntStream.range(1, years.size())
-                            .mapToObj(i -> new ProducerIntervalDto(
-                                    producer,
-                                    years.get(i) - years.get(i-1),
-                                    years.get(i-1),
-                                    years.get(i)
-                            ));
-                })
-                .collect(Collectors.toList());
+        if (years.size() > 1 && insertPos > 0) {
+            ProducerIntervalDto intervalDto = createIntervalDto(producer, years, insertPos, year);
+            tracker.updateMinMax(intervalDto);
+        }
     }
 
-    private IntervalResponseDto filterMinMaxIntervals(List<ProducerIntervalDto> intervals) {
+    private int insertYearSorted(List<Integer> years, int year) {
+        int insertPos = Collections.binarySearch(years, year);
+        if (insertPos < 0) {
+            insertPos = -(insertPos + 1);
+        }
+        years.add(insertPos, year);
+        return insertPos;
+    }
 
-        Comparator<ProducerIntervalDto> intervalComparator =
-                Comparator.comparingInt(ProducerIntervalDto::getInterval);
+    private ProducerIntervalDto createIntervalDto(String producer, List<Integer> years, int insertPos, int currentYear) {
+        int previousYear = years.get(insertPos - 1);
+        int interval = currentYear - previousYear;
+        return new ProducerIntervalDto(producer, interval, previousYear, currentYear);
+    }
 
-        int minInterval = intervals.stream()
-                .min(intervalComparator)
-                .orElseThrow()
-                .getInterval();
-
-        int maxInterval = intervals.stream()
-                .max(intervalComparator)
-                .orElseThrow()
-                .getInterval();
-
-        List<ProducerIntervalDto> minIntervals = intervals.stream()
-                .filter(i -> i.getInterval() == minInterval)
-                .collect(Collectors.toList());
-
-        List<ProducerIntervalDto> maxIntervals = intervals.stream()
-                .filter(i -> i.getInterval() == maxInterval)
-                .collect(Collectors.toList());
-
-        return new IntervalResponseDto(minIntervals, maxIntervals);
+    private IntervalResponseDto buildIntervalResponse(IntervalTrackerService tracker) {
+        return tracker.hasIntervals()
+                ? new IntervalResponseDto(tracker.getMinIntervals(), tracker.getMaxIntervals())
+                : new IntervalResponseDto(List.of(), List.of());
     }
 }
